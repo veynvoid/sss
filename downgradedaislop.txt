@@ -29,6 +29,7 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local SoundService = game:GetService("SoundService")
+local TextService = game:GetService("TextService")
 local ContentProvider = game:GetService("ContentProvider")
 local CoreGui = pcall(function() return game:GetService("CoreGui") end) and game:GetService("CoreGui") or game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
 
@@ -241,12 +242,23 @@ assist.hoverColor = Color3.fromRGB(40, 40, 40)
 assist.mutedTextColor = Color3.fromRGB(165, 165, 165)
 assist.primaryTextColor = Color3.fromRGB(235, 235, 235)
 
-assist.matchNames = {"STARTS WITH", "CONTAINS", "ENDS WITH"}; assist.sortNames = {"SMART (STANDARD)", "HARD (LENGTH)", "KILLER (X,Z,Q)"}; assist.speedNames = {"SLOW", "HUMAN", "FAST", "INSTANT"}
-assist.hideUsed = true; assist.usedWords = {}; assist.pendingWords = {}; assist.rejectedWords = {}; assist.usedCount = 0; assist.toggleKey = Enum.KeyCode.V; assist.isBindingKey = false; assist.isMenuOpen = false; local isMenuAnimating = false
+assist.matchNames = {"STARTS WITH", "CONTAINS", "ENDS WITH"}; assist.sortNames = {"SMART (STANDARD)", "HARD (LENGTH)", "KILLER (X,Z,Q)"}; assist.speedNames = {"SLOW", "HUMAN", "FAST", "INSTANT", "TURBO"}
+assist.hideUsed = true; assist.usedWords = {}; assist.attemptedWords = {}; assist.pendingWords = {}; assist.rejectedWords = {}; assist.usedCount = 0; assist.toggleKey = Enum.KeyCode.V; assist.isBindingKey = false; assist.isMenuOpen = false; local isMenuAnimating = false
+assist.sessionBlockedWords = {}
+do
+    local env = getgenv and getgenv() or _G
+    local jobId = tostring(game.JobId or "")
+    if not env._RaxoSessionWords or env._RaxoSessionWords.JobId ~= jobId then
+        env._RaxoSessionWords = {JobId = jobId, Words = {}}
+    end
+    assist.sessionMemory = env._RaxoSessionWords
+    assist.sessionBlockedWords = env._RaxoSessionWords.Words
+end
 assist.wasInMatch = false; assist.matchEndTimer = nil; assist.matchStartedAt = 0
 assist.turnarounds = 0; assist.currentTrapLength = 2
 assist.lastBlockedWord = ""; assist.lastBlockedSource = ""; assist.lastBlockedAt = 0
-assist.lastSeenGameWord = ""; assist.lastTurnName = nil
+assist.lastSeenGameWord = ""; assist.lastCapturedVisibleWord = ""; assist.lastTurnName = nil
+assist.wordChangesInTurn = {}; assist.promptSamples = {}; assist.promptResolutionCache = {}; assist.promptRejectedReadings = {}
 assist.longestWordInTurn = ""
 assist.lastWordInTurn = ""; assist.lastCompleteWordInTurn = ""; assist.turnPrompt = ""
 assist.savedTurnPrompt = ""; assist.savedPromptTurnVersion = -1
@@ -256,7 +268,7 @@ assist.isAutoTypeEnabled = false; assist.auto_MatchMode = 1; assist.auto_SortMod
 assist.strategyMode = 1; assist.strategyNames = {"STANDARD", "GENEROUS MODE", "EVIL MODE"}; assist.generousCache = {}; assist.oneByOneTargetCache = {}; assist.oneByOneAnalysisCache = {}; assist.oneByOneRankedCache = {}; assist.oneByOneComputing = {}; assist.oneByOnePlayerOverride = 0; assist.oneByOneGeneration = 0
 assist.auto_MakeMistakes = false; assist.auto_SpeedMode = 4; assist.currentCPM = 3000; assist.autoTrapEnabled = true
 assist.autoSuggestionEnabled = true; assist.autoSuggestionWord = nil; assist.autoSuggestionPrompt = ""; assist.autoSuggestionLastKey = ""; assist.manualSubmittedWord = nil
-assist.spamModeEnabled = false; assist.spamSearchEnabled = false; assist.spamRadarEnabled = false; assist.spamSuffixes = {}; assist.spamSuffixIndex = 1; assist.spamCurrentSuffix = nil
+assist.spamModeEnabled = false; assist.spamSearchEnabled = false; assist.spamRadarEnabled = false; assist.spamSuffixes = assist.sessionMemory.SpamSuffixes or {}; assist.sessionMemory.SpamSuffixes = assist.spamSuffixes; assist.spamSuffixIndex = 1; assist.spamCurrentSuffix = nil
 assist.humanizeEnabled = true
 assist.selectedMode, assist.strategyMode = SelectMode()
 if assist.selectedMode == nil then return end
@@ -269,7 +281,7 @@ assist.search_CurrentPage = 1; assist.WORDS_PER_PAGE = 150; assist.search_Action
 assist.radarUpdateVersion = 0; assist.radarWorkerRunning = false; assist.radarRequestedQuery = ""; assist.lastActiveTurnName = nil
 assist.keyboardLayout = "QWERTY"; assist.KEY_POS = {}; assist.isAutoPlayScheduled = false; assist.lastAutoCheck = 0
 assist.isTyping = false; assist.isRecovering = false; assist.autoAttemptKey = ""; assist.lastSubmittedWord = nil; assist.lastSubmittedAt = 0
-assist.lastSubmittedPrefix = ""; assist.lastSubmittedDisplayLength = 0; assist.lastSubmittedTypedCount = 0; assist.lastSubmissionWasAuto = false
+assist.lastSubmittedPrefix = ""; assist.lastSubmittedDisplayLength = 0; assist.lastSubmittedTypedCount = 0; assist.lastSubmissionWasAuto = false; assist.lastSubmittedVisualLimitReached = false
 
 assist.sound_MatchEnabled = true
 assist.sound_NotifyEnabled = true
@@ -455,6 +467,37 @@ function assist.ParseDictionary(text, shouldCancel)
     return words, wordSet, stats
 end
 
+local function IsRelatedTrapSolve(a, b)
+    local function isInflection(base, variant)
+        if #base < 3 or #variant <= #base then return false end
+        if string_sub(variant, 1, #base) == base then
+            local ending = string_sub(variant, #base + 1)
+            if ending == "s" or ending == "es" or ending == "ed" or ending == "ing"
+                or ending == "er" or ending == "ers" then return true end
+        end
+        if string_sub(base, -1) == "y" and variant == string_sub(base, 1, -2) .. "ies" then return true end
+        if string_sub(base, -1) == "e" and (variant == string_sub(base, 1, -2) .. "ing"
+            or variant == string_sub(base, 1, -2) .. "er"
+            or variant == string_sub(base, 1, -2) .. "ers") then return true end
+        local last = string_sub(base, -1)
+        if last:match("[bcdfghjklmnpqrstvwxyz]") and
+            (variant == base .. last .. "ing" or variant == base .. last .. "ed") then return true end
+        return false
+    end
+    return isInflection(a, b) or isInflection(b, a)
+end
+
+function assist.HasThreeDistinctTrapSolves(solves)
+    if #solves ~= 3 then return false end
+    for index, word in ipairs(solves) do
+        if not word:match("^[a-z]+$") then return false end
+        for nextIndex = index + 1, #solves do
+            if IsRelatedTrapSolve(word, solves[nextIndex]) then return false end
+        end
+    end
+    return true
+end
+
 function assist.LoadExternalFiles(baseWords, baseSet, proMode, shouldCancel)
     baseWords = baseWords or assist.baseDictionary
     baseSet = baseSet or assist.baseDictionarySet
@@ -467,7 +510,7 @@ function assist.LoadExternalFiles(baseWords, baseSet, proMode, shouldCancel)
     }
     local prefixCounts, giverSuffixes = {}, {}
     for index, word in ipairs(baseWords) do
-        if proMode or not word:find("'", 1, true) then
+        if proMode or word:match("^[a-z]+$") then
             for length = 2, math.min(4, #word) do
                 local prefix, suffix = string_sub(word, 1, length), string_sub(word, -length)
                 if #word > length then
@@ -487,7 +530,7 @@ function assist.LoadExternalFiles(baseWords, baseSet, proMode, shouldCancel)
             and (prefixCounts[suffix] or 0) > 0 and prefixCounts[suffix] <= assist.MAX_TRAP_SOLVES
             and suffix:find("[a-z]")
             and not suffix:find("[-'][-']")
-            and (proMode or not suffix:find("'", 1, true)) then
+            and (proMode or suffix:match("^[a-z]+$")) then
             data.TrapSuffixes[suffix] = assist.MAX_TRAP_SCORE
             data.TrapSuffixLengths[#suffix] = true
             data.TrapCountByLength[#suffix] = data.TrapCountByLength[#suffix] + 1
@@ -502,7 +545,7 @@ function assist.LoadExternalFiles(baseWords, baseSet, proMode, shouldCancel)
         if #(word:gsub("[^a-z]", "")) >= 3 and (proMode or word:match("^[a-z]+$")) then
             data.oneByOneWords[#data.oneByOneWords + 1] = word
         end
-        if proMode or not word:find("'", 1, true) then
+        if proMode or word:match("^[a-z]+$") then
             for length = 2, math.min(4, #word - 1) do
                 local prefix = string_sub(word, 1, length)
                 local solves = data.TrapSolves[prefix]
@@ -524,7 +567,17 @@ function assist.LoadExternalFiles(baseWords, baseSet, proMode, shouldCancel)
             task.wait()
         end
     end
-    for suffix, solves in pairs(data.TrapSolves) do data.TrapRanks[suffix] = math.clamp(11 - #solves, 1, 10) end
+    for suffix, solves in pairs(data.TrapSolves) do
+        if not proMode and not assist.HasThreeDistinctTrapSolves(solves) then
+            data.TrapSolves[suffix] = nil
+            data.TrapSuffixes[suffix] = nil
+            data.TrapSuffixLengths[#suffix] = nil
+            data.TrapCountByLength[#suffix] = data.TrapCountByLength[#suffix] - 1
+            trapCount = trapCount - 1
+        else
+            data.TrapRanks[suffix] = math.clamp(11 - #solves, 1, 10)
+        end
+    end
     table.sort(data.oneByOneWords)
     if shouldCancel and shouldCancel() then return nil, "CANCELLED" end
     
@@ -541,7 +594,9 @@ end
 
 function assist.TriggerAllRefreshes()
     assist.search_CurrentPage = 1
-    if updateSearchResults then task.spawn(updateSearchResults) end
+    if updateSearchResults and assist.yandereSearchTab and assist.yandereSearchTab.Visible then
+        task.spawn(updateSearchResults)
+    end
     if assist.sidebarEnabled and updateSidebar and assist.lastSidebarQuery ~= "-1" then
         updateSidebar(assist.lastSidebarQuery)
     end
@@ -566,11 +621,11 @@ end
 
 function assist.IsProOnlyWord(word)
     word = tostring(word or "")
-    return string_find(word, "'", 1, true) ~= nil
+    return word:find("[-']") ~= nil
 end
 
 function assist.IsWordAllowedByMode(word)
-    if not assist.proModeEnabled and word:find("'", 1, true) then return false end
+    if not assist.proModeEnabled and not word:match("^[a-z]+$") then return false end
     if not assist.oneByOneEnabled then return true end
     return #(word:gsub("[^a-z]", "")) >= 3 and (assist.proModeEnabled or word:match("^[a-z]+$") ~= nil)
 end
@@ -601,6 +656,7 @@ end
 function assist.RegisterWordUsed(w, wasTypedByLocalPlayer, allowUnknown)
     local word = assist.CanonicalizeWord(w, false) or assist.CanonicalizeWord(w, allowUnknown == true)
     if not word then return false end
+    assist.sessionBlockedWords[word] = true
     assist.pendingWords[word] = nil
     if assist.usedWords[word] then return false end
     assist.usedWords[word] = true
@@ -621,6 +677,20 @@ function assist.RegisterWordUsed(w, wasTypedByLocalPlayer, allowUnknown)
 
     assist.TriggerAllRefreshes()
     return true
+end
+
+function assist.BlockObservedWordFamily(observed)
+    if #observed < 5 then return end
+    local source = assist.radarPrefixIndex[string_sub(observed, 1, 2)] or {}
+    local changed = false
+    for _, word in ipairs(source) do
+        if #word >= #observed and string_sub(word, 1, #observed) == observed
+            and not assist.sessionBlockedWords[word] then
+            assist.sessionBlockedWords[word] = true
+            changed = true
+        end
+    end
+    if changed then assist.InvalidateTrapState() end
 end
 
 function assist.IsWordSuppressed(word)
@@ -687,7 +757,7 @@ function assist.SendKeyCode(key)
     if VirtualInputManager then
         local pressed = pcall(function() VirtualInputManager:SendKeyEvent(true, key, false, game) end)
         if pressed then
-            task.wait(0.008)
+            task.wait(0.002)
             local released = pcall(function() VirtualInputManager:SendKeyEvent(false, key, false, game) end)
             if released then return true end
         end
@@ -696,7 +766,7 @@ function assist.SendKeyCode(key)
     if type(keypress) == "function" and type(keyrelease) == "function" and virtualKey then
         local pressed = pcall(keypress, virtualKey)
         if pressed then
-            task.wait(0.008)
+            task.wait(0.002)
             if pcall(keyrelease, virtualKey) then return true end
         end
     end
@@ -724,38 +794,58 @@ function assist.CanContinueTyping(generation, turnVersion, requireOwnTurn)
         and (not requireOwnTurn or assist.IsMyTurn())
 end
 
-function assist.TypeCharacter(character, expectedBefore, canContinue)
+function assist.TypeCharacter(character, expectedBefore, canContinue, visualLimitReached)
     if not canContinue() then return false end
-    local before = assist.GetCurrentGameWord()
-    local function appeared()
-        local actual = assist.GetCurrentGameWord()
-        return #actual > #before or actual == expectedBefore .. character
-    end
-    local function waitForCharacter()
-        for _ = 1, 8 do
-            if not canContinue() then return false end
-            if appeared() then return true end
-            task.wait(0.025)
+    if visualLimitReached or #expectedBefore >= 8 then
+        local sent = assist.SimulateKey(character)
+        if not sent and VirtualInputManager then
+            sent = pcall(function() VirtualInputManager:SendTextInput(character) end)
         end
-        return canContinue() and appeared()
+        return sent, true
     end
-    if assist.SimulateKey(character) and waitForCharacter() then return true end
+    if assist.SimulateKey(character) then return true, false end
     if not canContinue() or not VirtualInputManager then return false end
     local sent = pcall(function() VirtualInputManager:SendTextInput(character) end)
-    return sent and waitForCharacter()
+    return sent, false
 end
 
-function assist.TypeWord(wordToType, prefixTyped, requireOwnTurn)
+function assist.FastDeleteTyped(count, originalPrefix, canContinue)
+    for index = 1, count do
+        if not canContinue() then break end
+        local current = assist.GetCurrentGameWord()
+        if #current <= #originalPrefix then break end
+        if not assist.SimulateKey(Enum.KeyCode.Backspace) then break end
+        if index % 8 == 0 then task.wait() end
+    end
+end
+
+function assist.HasSameLetters(a, b)
+    if #a ~= #b then return false end
+    local counts = {}
+    for index = 1, #a do
+        local letter = string_sub(a, index, index)
+        counts[letter] = (counts[letter] or 0) + 1
+    end
+    for index = 1, #b do
+        local letter = string_sub(b, index, index)
+        counts[letter] = (counts[letter] or 0) - 1
+        if counts[letter] < 0 then return false end
+    end
+    return true
+end
+
+function assist.TypeWord(wordToType, prefixTyped, requireOwnTurn, turboOverride)
     if assist.oneByOneEnabled then return assist.TypeOneByOneLetter(wordToType, prefixTyped, requireOwnTurn) end
     if assist.isTyping or assist.isRecovering then return false end
     if assist.lastSubmittedWord and assist.pendingWords[assist.lastSubmittedWord] then return false end
     local word = assist.CanonicalizeWord(wordToType)
     if not word or assist.IsWordUnavailable(word, true) then return false end
+    local turbo = turboOverride == true or assist.auto_SpeedMode == 5
     assist.typingGeneration = assist.typingGeneration + 1
     local generation, turnVersion = assist.typingGeneration, assist.turnVersion
     assist.isTyping = true
     local function canContinue() return assist.CanContinueTyping(generation, turnVersion, requireOwnTurn) end
-    local typedCount, displayPrefix = 0, ""
+    local typedCount, displayPrefix, visualLimitReached, attemptedInput = 0, "", false, false
     local ok, success = xpcall(function()
         local focusedBox = UserInputService:GetFocusedTextBox()
         if focusedBox then
@@ -771,7 +861,10 @@ function assist.TypeWord(wordToType, prefixTyped, requireOwnTurn)
         elseif livePrefix ~= "" then
             prefixTyped = livePrefix
         end
-        if string_sub(word, 1, #prefixTyped) ~= prefixTyped then return false end
+        local promptMatches = livePrefix == prefixTyped or (requireOwnTurn
+            and #livePrefix == #prefixTyped and assist.ResolvePrompt(livePrefix) == prefixTyped)
+        if prefixTyped == "" or not promptMatches or #word <= #prefixTyped
+            or string_sub(word, 1, #prefixTyped) ~= prefixTyped then return false end
         displayPrefix = livePrefix
         if not assist.QueuePendingWord(word) then return false end
         assist.lastSubmittedWord = word
@@ -779,6 +872,7 @@ function assist.TypeWord(wordToType, prefixTyped, requireOwnTurn)
         assist.lastSubmittedPrefix = prefixTyped
         assist.lastSubmittedDisplayLength = #displayPrefix
         assist.lastSubmittedTypedCount = 0
+        assist.lastSubmittedVisualLimitReached = false
         assist.lastSubmissionWasAuto = requireOwnTurn == true
         assist.lastSubmissionFeedback = assist.GetWrongAnswerReason()
         local remaining = string_sub(word, #prefixTyped + 1)
@@ -793,37 +887,58 @@ function assist.TypeWord(wordToType, prefixTyped, requireOwnTurn)
                 task.wait(math.max(0.01, 60 / math.max(1, assist.currentCPM)))
                 if not canContinue() or not assist.SimulateKey(Enum.KeyCode.Backspace) then return false end
             end
-            if not assist.TypeCharacter(character, string_sub(word, 1, #prefixTyped + i - 1), canContinue) then return false end
+            attemptedInput = true
+            local entered, unseen = assist.TypeCharacter(character, string_sub(word, 1, #prefixTyped + i - 1), canContinue, visualLimitReached)
+            if not entered then return false end
+            visualLimitReached = visualLimitReached or unseen
             typedCount = typedCount + 1
-            if assist.lastSubmittedWord == word then assist.lastSubmittedTypedCount = typedCount end
-            if assist.humanizeEnabled then
+            if assist.lastSubmittedWord == word then
+                assist.lastSubmittedTypedCount = typedCount
+                assist.lastSubmittedVisualLimitReached = visualLimitReached
+            end
+            if assist.humanizeEnabled and not turbo and assist.auto_SpeedMode < 4 then
                 local delay = assist.auto_SpeedMode < 4 and (60 / math.max(1, assist.currentCPM)) or 0.075
                 task.wait(delay * (0.72 + math.random() * 0.68))
                 if i < #remaining and i >= pauseAt then
                     task.wait(0.10 + math.random() * 0.22)
                     pauseAt = i + math.random(4, 7)
                 end
-            else
-                task.wait(assist.auto_SpeedMode < 4 and (60 / math.max(1, assist.currentCPM)) or 0.008)
+            elseif not turbo and assist.auto_SpeedMode < 4 then
+                task.wait(60 / math.max(1, assist.currentCPM))
             end
         end
-        task.wait(assist.humanizeEnabled and (0.10 + math.random() * 0.22) or 0.015)
+        if assist.humanizeEnabled and not turbo and assist.auto_SpeedMode < 4 then
+            task.wait(0.06 + math.random() * 0.08)
+        end
         if not canContinue() then return false end
         local observed = assist.GetCurrentGameWord()
-        if #observed < #displayPrefix + #remaining then return false end
+        local function complete()
+            if visualLimitReached then return true end
+            if #observed ~= #word then return false end
+            if #word > 8 then return true end
+            return string_sub(observed, #prefixTyped + 1) == remaining
+                and assist.HasSameLetters(string_sub(observed, 1, #prefixTyped), prefixTyped)
+        end
+        for _ = 1, 3 do
+            if complete() then break end
+            task.wait(0.015)
+            if not canContinue() then return false end
+            observed = assist.GetCurrentGameWord()
+        end
+        if not complete() then return false end
         assist.lastSubmittedAt = time()
-        return assist.SimulateKey(Enum.KeyCode.Return)
+        local submitted = assist.SimulateKey(Enum.KeyCode.Return)
+        if submitted then
+            assist.attemptedWords[word] = true
+            assist.sessionBlockedWords[word] = true
+        end
+        return submitted
     end, function(message) return tostring(message) end)
     if not ok or not success then
         if generation == assist.typingGeneration then
             
             if canContinue() then
-                local readable, current = pcall(assist.GetCurrentGameWord)
-                if readable and type(current) == "string" and #current >= #displayPrefix then
-                    for _ = 1, math.min(typedCount, #current - #displayPrefix) do
-                        if not canContinue() or not assist.SimulateKey(Enum.KeyCode.Backspace) then break end
-                    end
-                end
+                assist.FastDeleteTyped(typedCount, displayPrefix, canContinue)
             end
             assist.pendingWords[word] = nil
             if assist.lastSubmittedWord == word then
@@ -832,9 +947,10 @@ function assist.TypeWord(wordToType, prefixTyped, requireOwnTurn)
                 assist.lastSubmittedPrefix = ""
                 assist.lastSubmittedDisplayLength = 0
                 assist.lastSubmittedTypedCount = 0
+                assist.lastSubmittedVisualLimitReached = false
                 assist.lastSubmissionWasAuto = false
             end
-            assist.softBlockedWords[word] = time() + 2
+            if attemptedInput then assist.softBlockedWords[word] = time() + 2 end
             assist.autoAttemptKey = ""
             assist.isTyping = false
             pcall(assist.TriggerAllRefreshes)
@@ -910,12 +1026,72 @@ function assist.GetCurrentGameWord()
     return assist.NormalizeWordText(out)
 end
 
+function assist.GetPromptAvailability(prefix)
+    local source = assist.prefixWordIndex and assist.prefixWordIndex[prefix]
+        or (assist.radarPrefixIndex and assist.radarPrefixIndex[string_sub(prefix, 1, 2)]) or {}
+    local found = 0
+    for _, word in ipairs(source or {}) do
+        if #word > #prefix and string_sub(word, 1, #prefix) == prefix
+            and assist.IsWordAllowedByMode(word) then
+            found = found + 1
+            if found >= 3 then break end
+        end
+    end
+    return found
+end
+
+function assist.ResolvePrompt(raw)
+    raw = assist.NormalizeWordText(tostring(raw or ""))
+    if assist.oneByOneEnabled or #raw < 2 or #raw > 4 or #assist.dictionary == 0
+        or not raw:match("^[a-z]+$") then return raw end
+    local expected = assist.currentTrapLength
+    if #raw ~= expected then
+        local stable, mostSamples = nil, 1
+        for observed, samples in pairs(assist.promptSamples) do
+            if #observed == expected and samples > mostSamples
+                and not assist.promptRejectedReadings[observed]
+                and assist.GetPromptAvailability(observed) > 0 then
+                stable, mostSamples = observed, samples
+            end
+        end
+        return stable or raw
+    end
+    local cached = assist.promptResolutionCache[raw]
+    if cached and cached.Version == assist.dictionaryVersion then return cached.Word end
+    local best, bestScore = raw, -math.huge
+    local seen, letters = {}, {}
+    for index = 1, #raw do letters[index] = string_sub(raw, index, index) end
+    local function inspect(candidate, swaps)
+        if seen[candidate] then return end
+        seen[candidate] = true
+        if assist.promptRejectedReadings[candidate] then return end
+        local available = assist.GetPromptAvailability(candidate)
+        if available == 0 then return end
+        local samples = assist.promptSamples[candidate] or 0
+        local score = samples * 20 + available * 3 - swaps * 4
+        if candidate == raw then score = score + 35 end
+        if #candidate == expected then score = score + 2 end
+        if score > bestScore then best, bestScore = candidate, score end
+    end
+    local function permute(index, swaps)
+        if index > #letters then inspect(table.concat(letters), swaps); return end
+        for nextIndex = index, #letters do
+            letters[index], letters[nextIndex] = letters[nextIndex], letters[index]
+            permute(index + 1, swaps + (nextIndex == index and 0 or 1))
+            letters[index], letters[nextIndex] = letters[nextIndex], letters[index]
+        end
+    end
+    permute(1, 0)
+    assist.promptResolutionCache[raw] = {Word = best, Version = assist.dictionaryVersion}
+    return best
+end
+
 function assist.GetOriginalTurnPrompt(liveWord)
     if assist.savedPromptTurnVersion == assist.turnVersion and assist.savedTurnPrompt ~= ""
         and assist.IsMyTurn() then
-        return assist.savedTurnPrompt
+        return assist.ResolvePrompt(assist.savedTurnPrompt)
     end
-    return assist.NormalizeWordText(tostring(liveWord or assist.GetCurrentGameWord()))
+    return assist.ResolvePrompt(liveWord or assist.GetCurrentGameWord())
 end
 
 function assist.IsFeedbackVisible(item)
@@ -971,20 +1147,23 @@ end
 function assist.IsWordUnavailable(word, strictUnused)
     local blockedUntil = assist.softBlockedWords[word]
     if blockedUntil and time() >= blockedUntil then assist.softBlockedWords[word] = nil; blockedUntil = nil end
-    return assist.Blacklist[word] == true or assist.rejectedWords[word] == true or blockedUntil ~= nil
-        or ((strictUnused or assist.hideUsed) and (assist.usedWords[word] == true or assist.pendingWords[word] ~= nil))
+    return assist.Blacklist[word] == true or assist.rejectedWords[word] == true
+        or assist.sessionBlockedWords[word] == true or blockedUntil ~= nil
+        or ((strictUnused or assist.hideUsed) and (assist.usedWords[word] == true
+            or assist.attemptedWords[word] == true or assist.pendingWords[word] ~= nil))
 end
 
 function assist.RecoverFromWrongAutoWord(reason)
     if assist.isRecovering or assist.isTyping or not assist.lastSubmittedWord or not assist.lastSubmissionWasAuto then return end
     if not assist.IsMyTurn() then return end
     local word = assist.lastSubmittedWord
-    local displayLength = assist.lastSubmittedDisplayLength or 0
     local turnVersion, generation = assist.turnVersion, assist.typingGeneration
     local typedCount = assist.lastSubmittedTypedCount or 0
     assist.isRecovering = true
     if reason == "INVALID" then
         assist.rejectedWords[word] = true
+        assist.promptRejectedReadings[assist.lastSubmittedPrefix] = true
+        assist.promptResolutionCache = {}
     elseif reason == "USED" then
         assist.RegisterWordUsed(word, true, true)
         assist.lastBlockedSource = "SERVER"
@@ -1000,15 +1179,9 @@ function assist.RecoverFromWrongAutoWord(reason)
     end
     task.spawn(function()
         local ok, recoveryError = xpcall(function()
-            task.wait(0.05)
+            task.wait(0.01)
             if not currentJob() then return end
-            local current = assist.GetCurrentGameWord()
-            if #current >= displayLength then
-                for _ = 1, math.min(typedCount, #current - displayLength) do
-                    if not currentJob() or not assist.SimulateKey(Enum.KeyCode.Backspace) then break end
-                    task.wait(assist.humanizeEnabled and 0.075 or 0.03)
-                end
-            end
+            assist.FastDeleteTyped(typedCount, assist.lastSubmittedPrefix or "", currentJob)
         end, function(message) return tostring(message) end)
         if generation == assist.typingGeneration and turnVersion == assist.turnVersion then
             if assist.lastSubmittedWord == word then
@@ -1017,6 +1190,7 @@ function assist.RecoverFromWrongAutoWord(reason)
                 assist.lastSubmittedPrefix = ""
                 assist.lastSubmittedDisplayLength = 0
                 assist.lastSubmittedTypedCount = 0
+                assist.lastSubmittedVisualLimitReached = false
                 assist.lastSubmissionWasAuto = false
             end
             assist.isRecovering = false
@@ -1033,7 +1207,7 @@ end
 
 function assist.MatchesEndingFilter(word, evilV1, evilV2, v2Text, evilV3, v3_1, v3_2, v3_3)
     if evilV1 and not (word:match("[xzqjv]$")) then return false end
-    if evilV2 then local s2 = (v2Text or ""):lower():match("^%s*(.-)%s*$"); if s2 and s2 ~= "" and (#word < #s2 or string_sub(word, -#s2) ~= s2) then return false end end
+    if evilV2 then local s2 = assist.NormalizeWordText(v2Text or ""); if s2 ~= "" and (#word < #s2 or string_sub(word, -#s2) ~= s2) then return false end end
     if evilV3 then
         local s3_1 = (v3_1 or ""):lower():match("^%s*(.-)%s*$"); local s3_2 = (v3_2 or ""):lower():match("^%s*(.-)%s*$"); local s3_3 = (v3_3 or ""):lower():match("^%s*(.-)%s*$")
         if (s3_1 ~= "") or (s3_2 ~= "") or (s3_3 ~= "") then
@@ -1111,11 +1285,13 @@ assist.profileTab = assist.makeTab("ProfileTab"); assist.profileTab.Visible = fa
 assist.yandereSearchTab = Instance.new("Frame"); assist.yandereSearchTab.Size = UDim2.new(1, 0, 1, 0); assist.yandereSearchTab.BackgroundTransparency = 1; assist.yandereSearchTab.Visible = false; assist.yandereSearchTab.ZIndex = 106; assist.yandereSearchTab.Parent = assist.contentPanel
 assist.tsundereAutoTab = assist.makeTab("AutoTypeTab")
 assist.himedereTrapsTab = assist.makeTab("TrapsTab")
+assist.spamGeneratorTab = assist.makeTab("SpamGeneratorTab")
 assist.dandereFilesTab = assist.makeTab("NotepadsTab"); assist.dandereFilesTab.Visible = false; assist.kuudereSettingsTab = assist.makeTab("SettingsTab")
 
 assist.tabs = {
     {Name="AUTO TYPE", Glyph="A", Frame=assist.tsundereAutoTab},
     {Name="SEARCH", Glyph="S", Frame=assist.yandereSearchTab},
+    {Name="SPAM GENERATOR", Glyph="P", Frame=assist.spamGeneratorTab},
     {Name="AUTO TRAPS", Glyph="T", Frame=assist.himedereTrapsTab},
     {Name="SETTINGS", Glyph="G", Frame=assist.kuudereSettingsTab}
 }
@@ -1151,6 +1327,9 @@ for i, td in ipairs(assist.tabs) do
         td.Frame.Visible = true
         btn.BackgroundColor3 = assist.hoverColor
         assist.pageTitle.Text = td.Name
+        if td.Frame == assist.yandereSearchTab and updateSearchResults then
+            task.spawn(updateSearchResults)
+        end
     end)
 end
 
@@ -1472,6 +1651,34 @@ assist.resetTurnaroundsBtn.MouseButton1Click:Connect(function()
     assist.RefreshAutomaticTrapStage(true)
 end)
 
+assist.applyPadding(assist.spamGeneratorTab, 20, 20, 40); assist.applyList(assist.spamGeneratorTab, 10)
+assist.makeHeader("SPAM GENERATOR", assist.spamGeneratorTab)
+assist.spamGeneratorHelp = Instance.new("TextLabel")
+assist.spamGeneratorHelp.Size = UDim2.new(1, 0, 0, 58)
+assist.spamGeneratorHelp.BackgroundTransparency = 1
+assist.spamGeneratorHelp.Text = "Find endings with at least 25 givers and 25 solves, and more givers than solves. Select several endings to use together."
+assist.spamGeneratorHelp.TextWrapped = true
+assist.spamGeneratorHelp.TextXAlignment = Enum.TextXAlignment.Left
+assist.spamGeneratorHelp.TextColor3 = assist.mutedTextColor
+assist.spamGeneratorHelp.TextSize = 13
+assist.spamGeneratorHelp.Font = Enum.Font.GothamMedium
+assist.spamGeneratorHelp.Parent = assist.spamGeneratorTab
+assist.spamSelectionBox = assist.makeInput("Selected spams, separated by commas...", assist.spamGeneratorTab)
+assist.spamSelectionBox.ClearTextOnFocus = false
+assist.spamSelectionBox.Text = table.concat(assist.spamSuffixes, ", ")
+assist.spamApplyBtn = assist.makeBtn("Apply selected spams", assist.spamGeneratorTab)
+assist.spamGenerateBtn = assist.makeBtn("Generate spams (25+ each)", assist.spamGeneratorTab)
+assist.spamGeneratorStatus = Instance.new("TextLabel")
+assist.spamGeneratorStatus.Size = UDim2.new(1, 0, 0, 34)
+assist.spamGeneratorStatus.BackgroundTransparency = 1
+assist.spamGeneratorStatus.Text = "Load the dictionary, then generate."
+assist.spamGeneratorStatus.TextWrapped = true
+assist.spamGeneratorStatus.TextXAlignment = Enum.TextXAlignment.Left
+assist.spamGeneratorStatus.TextColor3 = assist.mutedTextColor
+assist.spamGeneratorStatus.TextSize = 12
+assist.spamGeneratorStatus.Font = Enum.Font.GothamMedium
+assist.spamGeneratorStatus.Parent = assist.spamGeneratorTab
+
 function assist.RenderTrapSliders()
     local count = (assist.TrapCountByLength or {})[assist.currentTrapLength] or 0
     local label = assist.automaticTrapStatusLabel
@@ -1489,9 +1696,10 @@ function assist.RenderTrapSliders()
         label.Parent = assist.himedereTrapsTab
         assist.automaticTrapStatusLabel = label
     end
-    label.Text = string.format("%s: searching %d-character endings with the fewest available solves.\n%d targets in the dictionary.\nTurnarounds: %d (5 for 3 characters, 10 for 4).",
+    local trapRule = assist.proModeEnabled and "the fewest available solves" or "exactly 3 unrelated solves"
+    label.Text = string.format("%s: searching %d-character endings with %s.\n%d targets in the dictionary.\nTurnarounds: %d (5 for 3 characters, 10 for 4).",
         assist.proModeEnabled and "PRO" or "CASUAL", assist.currentTrapLength,
-        count, assist.turnarounds)
+        trapRule, count, assist.turnarounds)
 end
 
 assist.applyPadding(assist.tsundereAutoTab, 20, 20, 40); assist.applyList(assist.tsundereAutoTab, 10)
@@ -1500,7 +1708,7 @@ assist.autoStatusLabel = assist.makeBtn("Words: waiting to load...", assist.tsun
 assist.autoStatusLabel.Active = false
 assist.autoStatusLabel.TextWrapped = true
 assist.yandere_autoTypeBtn = assist.makeBtn("Auto type: OFF", assist.tsundereAutoTab); assist.tsundere_autoSpeedBtn = assist.makeBtn("Typing Speed: INSTANT", assist.tsundereAutoTab); assist.yandere_autoMistakeBtn = assist.makeBtn("Typing mistakes: OFF", assist.tsundereAutoTab); assist.humanizeBtn = assist.makeBtn("Natural timing: ON", assist.tsundereAutoTab); assist.autoTrapBtn = assist.makeBtn("Trap help: ON", assist.tsundereAutoTab); assist.autoSuggestionBtn = assist.makeBtn("Word hint: ON", assist.tsundereAutoTab)
-assist.spamModeBtn = assist.makeBtn("Focus Mode: OFF", assist.tsundereAutoTab)
+assist.spamModeBtn = assist.makeBtn("Spam Mode: OFF", assist.tsundereAutoTab)
 assist.strategyModeBtn = assist.makeBtn("Word Strategy: " .. assist.strategyNames[assist.strategyMode], assist.tsundereAutoTab)
 assist.strategyModeBtn.BackgroundColor3 = assist.strategyMode ~= 1 and assist.currentAccentColor or assist.panelColor
 assist.strategyModeBtn.TextColor3 = assist.strategyMode ~= 1 and Color3.fromRGB(0, 0, 0) or Color3.fromRGB(255, 255, 255)
@@ -1516,6 +1724,7 @@ assist.makeHeader("MORE OPTIONS", assist.tsundereAutoTab)
 assist.tsundere_autoMatchModeBtn = assist.makeBtn("Match: STARTS WITH", assist.tsundereAutoTab); assist.tsundere_autoSortModeBtn = assist.makeBtn("Sort: SMART (STANDARD)", assist.tsundereAutoTab)
 assist.yandere_autoEvilModeBtn = assist.makeBtn("Hard endings (x, z, q, j, v): OFF", assist.tsundereAutoTab); assist.yandere_autoEvilModeV2Btn = assist.makeBtn("Ending filter: OFF", assist.tsundereAutoTab)
 assist.yandere_autoEvilInputV2, assist.aV2F = assist.makeInput("Suffix (e.g. ing)...", assist.tsundereAutoTab); assist.aV2F.Visible = false
+assist.yandere_autoEvilInputV2.ClearTextOnFocus = false
 assist.yandere_autoEvilModeV3Btn = assist.makeBtn("More ending filters: OFF", assist.tsundereAutoTab)
 assist.v3CA = Instance.new("Frame"); assist.v3CA.Size = UDim2.new(1, 0, 0, 40); assist.v3CA.BackgroundTransparency = 1; assist.v3CA.Visible = false; assist.v3CA.Parent = assist.tsundereAutoTab; assist.applyList(assist.v3CA, 10, true)
 assist.bW = UDim2.new(0.333, -7, 0, 40)
@@ -1555,6 +1764,7 @@ assist.applyPadding(assist.yandereSearchTab, 20, 20, 0); assist.applyList(assist
 assist.yandereSearchBox, sBoxFrame = assist.makeInput("Type letters to search...", assist.yandereSearchTab, UDim2.new(1, 0, 0, 40))
 assist.searchSpamModeBtn = assist.makeBtn("Focus Mode: OFF", assist.yandereSearchTab)
 assist.yandere_evilBoxV2, assist.sV2Frame = assist.makeInput("Ending filter...", assist.yandereSearchTab, UDim2.new(1, 0, 0, 40)); assist.sV2Frame.Visible = false
+assist.yandere_evilBoxV2.ClearTextOnFocus = false
 assist.v3CS = Instance.new("Frame"); assist.v3CS.Size = UDim2.new(1, 0, 0, 40); assist.v3CS.BackgroundTransparency = 1; assist.v3CS.Visible = false; assist.v3CS.Parent = assist.yandereSearchTab; assist.applyList(assist.v3CS, 10, true)
 assist.yandere_evilBoxV3_1 = assist.makeInput("Suffix 1...", assist.v3CS, assist.bW); assist.yandere_evilBoxV3_2 = assist.makeInput("Suffix 2...", assist.v3CS, assist.bW); assist.yandere_evilBoxV3_3 = assist.makeInput("Suffix 3...", assist.v3CS, assist.bW)
 
@@ -1604,7 +1814,7 @@ assist.sbSpamToggle = Instance.new("TextButton")
 assist.sbSpamToggle.Size = UDim2.new(1, -20, 0, 35)
 assist.sbSpamToggle.Position = UDim2.new(0, 10, 0, 50)
 assist.sbSpamToggle.BackgroundColor3 = assist.panelColor
-assist.sbSpamToggle.Text = "  Focus Mode: OFF"
+assist.sbSpamToggle.Text = "  Spam Mode: OFF"
 assist.sbSpamToggle.TextColor3 = Color3.fromRGB(255,255,255)
 assist.sbSpamToggle.Font = Enum.Font.GothamMedium
 assist.sbSpamToggle.TextSize = 12
@@ -1637,7 +1847,7 @@ assist.sbEBox.PlaceholderText = "Suffix (e.g. ing)..."
 assist.sbEBox.Text = assist.sidebar_EvilV2Text
 assist.sbEBox.Font = Enum.Font.GothamMedium
 assist.sbEBox.TextSize = 12
-assist.sbEBox.ClearTextOnFocus = true
+assist.sbEBox.ClearTextOnFocus = false
 assist.sbEBox.Visible = assist.sidebar_EvilModeV2
 assist.sbEBox.ZIndex = 101
 assist.sbEBox.Parent = assist.sidebarFrame
@@ -1896,14 +2106,21 @@ end
 
 function assist.UpdateAutomaticSuggestion(isTurn, liveWord)
     local live = assist.NormalizeWordText(tostring(liveWord or ""))
+    local customSuffix = assist.spamModeEnabled and table.concat(assist.GetAutoSpamSuffixes(), ",")
+        or (assist.auto_EvilModeV2 and assist.NormalizeWordText(assist.yandere_autoEvilInputV2.Text) or "")
 
     local isLocalTurn = isTurn == true
-    if not assist.autoSuggestionEnabled or not assist.wasInMatch or not isLocalTurn or live == "" then
+    if not assist.autoSuggestionEnabled or assist.isAutoTypeEnabled or not assist.wasInMatch or not isLocalTurn or live == "" then
         assist.HideAutomaticSuggestion()
         return
     end
 
-    if assist.autoSuggestionWord and ((not assist.oneByOneEnabled and assist.IsWordSuppressed(assist.autoSuggestionWord)) or (live ~= assist.autoSuggestionPrompt and string_sub(assist.autoSuggestionWord, 1, #live) ~= live)) then assist.HideAutomaticSuggestion() end
+    local promptKey = tostring(assist.lastTurnName or "") .. ":" .. live .. ":" .. customSuffix
+    if assist.autoSuggestionWord and (assist.autoSuggestionLastKey ~= promptKey
+        or (not assist.oneByOneEnabled and assist.IsWordSuppressed(assist.autoSuggestionWord))
+        or (live ~= assist.autoSuggestionPrompt and string_sub(assist.autoSuggestionWord, 1, #live) ~= live)) then
+        assist.HideAutomaticSuggestion()
+    end
     if assist.autoSuggestionWord then
         if live == assist.autoSuggestionWord or assist.manualSubmittedWord == assist.autoSuggestionWord then
             assist.HideAutomaticSuggestion()
@@ -1913,7 +2130,6 @@ function assist.UpdateAutomaticSuggestion(isTurn, liveWord)
         return
     end
 
-    local promptKey = tostring(assist.lastTurnName or "") .. ":" .. live
     if assist.autoSuggestionLastKey == promptKey then return end
 
     local ok, matches = pcall(function()
@@ -1921,13 +2137,17 @@ function assist.UpdateAutomaticSuggestion(isTurn, liveWord)
             local target = assist.GetOneByOneTarget(live)
             return target and {target} or {}
         end
+        if assist.spamModeEnabled and customSuffix ~= "" then
+            local candidate = assist.GetAutoSpamCandidate(live)
+            return candidate and {candidate} or {}
+        end
         if assist.autoTrapEnabled then
             local giver = assist.FindAutomaticTrapGiver(live)
             if giver then return {giver} end
         end
         if assist.strategyMode ~= 1 then return assist.GetStrategyWordsList(live) end
         if assist.auto_SortMode == 2 then
-            return assist.GetWordsList(live, 1, assist.auto_MatchMode, 2, false, false, "", false, "", "", "", nil, true, true, true)
+            return assist.GetWordsList(live, 1, assist.auto_MatchMode, 2, false, assist.auto_EvilModeV2, assist.yandere_autoEvilInputV2.Text, false, "", "", "", nil, true, true, true)
         end
         return assist.GetWordsList(live, 1, assist.auto_MatchMode, assist.auto_SortMode, assist.auto_EvilMode, assist.auto_EvilModeV2, assist.yandere_autoEvilInputV2.Text, assist.auto_EvilModeV3, assist.yandere_autoEvilInputV3_1.Text, assist.yandere_autoEvilInputV3_2.Text, assist.yandere_autoEvilInputV3_3.Text, nil, true, true, not assist.autoTrapEnabled)
     end)
@@ -2053,23 +2273,20 @@ end
 function assist.GetTrapRank(suffix)
     local remaining = 0
     for _, solve in ipairs(assist.TrapSolves[suffix] or {}) do
-        if not assist.usedWords[solve] and not assist.pendingWords[solve] then remaining = remaining + 1 end
+        if not assist.usedWords[solve] and not assist.sessionBlockedWords[solve]
+            and not assist.attemptedWords[solve] and not assist.pendingWords[solve]
+            and not assist.rejectedWords[solve] then remaining = remaining + 1 end
     end
+    if not assist.proModeEnabled and remaining ~= 3 then return 0 end
     return remaining > 0 and math.clamp(11 - remaining, 1, 10) or 0
 end
 
 function assist.IsTrapActive(suffix)
     local cached = assist.trapActiveCache[suffix]
     if cached ~= nil then return cached end
-    for _, solve in ipairs(assist.TrapSolves[suffix] or {}) do
-        if not assist.usedWords[solve] then
-            assist.trapActiveCache[suffix] = true
-            return true
-        end
-    end
-    
-    assist.trapActiveCache[suffix] = false
-    return false
+    local active = assist.GetTrapRank(suffix) > 0
+    assist.trapActiveCache[suffix] = active
+    return active
 end
 
 function assist.GetWordTrapInfo(word)
@@ -2110,12 +2327,17 @@ function assist.FindAutomaticTrapGiver(prompt)
             and string_sub(word, 1, length) ~= suffix
             and assist.IsWordAllowedByMode(word)
             and not assist.IsWordUnavailable(word, true)
+            and assist.MatchesEndingFilter(word, assist.auto_EvilMode, assist.auto_EvilModeV2,
+                assist.yandere_autoEvilInputV2.Text, assist.auto_EvilModeV3,
+                assist.yandere_autoEvilInputV3_1.Text, assist.yandere_autoEvilInputV3_2.Text,
+                assist.yandere_autoEvilInputV3_3.Text)
             and not assist.IsSelfSolveWord(word, prompt) then
             local remaining = remainingBySuffix[suffix]
             if remaining == nil then
                 remaining = 0
                 for _, solve in ipairs(assist.TrapSolves[suffix] or {}) do
-                    if not assist.usedWords[solve]
+                    if not assist.usedWords[solve] and not assist.sessionBlockedWords[solve]
+                        and not assist.attemptedWords[solve]
                         and not assist.pendingWords[solve]
                         and not assist.rejectedWords[solve] then
                         remaining = remaining + 1
@@ -2123,8 +2345,9 @@ function assist.FindAutomaticTrapGiver(prompt)
                 end
                 remainingBySuffix[suffix] = remaining
             end
-            if remaining == 1 then return word, suffix, 1 end
-            if remaining > 0 and (not bestCount or remaining < bestCount
+            if assist.proModeEnabled and remaining == 1 then return word, suffix, 1 end
+            if (assist.proModeEnabled and remaining > 0 or not assist.proModeEnabled and remaining == 3)
+                and (not bestCount or remaining < bestCount
                 or (remaining == bestCount and word < bestWord)) then
                 bestWord, bestSuffix, bestCount = word, suffix, remaining
             end
@@ -2382,12 +2605,11 @@ function assist.GetWordsList(detected, maxCount, matchMode, sortMode, evilV1, ev
     local limit = math.max(1, maxCount or 1)
     local matches = {}
     detected = assist.NormalizeWordText(tostring(detected or ""))
+    local lockedSuffix = evilV2 and assist.NormalizeWordText(v2Suffix or "") ~= ""
 
     if sortMode == 2 then
         evilV1 = false
-        evilV2 = false
         evilV3 = false
-        v2Suffix = ""
         v3_1, v3_2, v3_3 = "", "", ""
     end
 
@@ -2480,17 +2702,36 @@ function assist.GetWordsList(detected, maxCount, matchMode, sortMode, evilV1, ev
     end
 
     if shouldCancel and shouldCancel() then return nil, true end
-    
+    if #matches == 0 then
+        if strategyMode then
+            return assist.GetWordsList(detected, maxCount, matchMode, sortMode,
+                evilV1, evilV2, v2Suffix, evilV3, v3_1, v3_2, v3_3,
+                shouldCancel, avoidSelfSolve, strictUnused, disableTrapPriority, nil)
+        end
+        if lockedSuffix then return matches end
+        if evilV1 or evilV2 or evilV3 then
+            return assist.GetWordsList(detected, maxCount, matchMode, sortMode,
+                false, false, "", false, "", "", "", shouldCancel,
+                avoidSelfSolve, strictUnused, disableTrapPriority, nil)
+        end
+        if avoidSelfSolve then
+            return assist.GetWordsList(detected, maxCount, matchMode, sortMode,
+                false, false, "", false, "", "", "", shouldCancel,
+                false, strictUnused, disableTrapPriority, nil)
+        end
+    end
     return matches
 end
 
 function assist.GetStrategyWordsList(detected)
-    return assist.GetWordsList(detected, 1, 1, 1, false, false, "", false, "", "", "", nil, true, true, true, assist.strategyMode)
+    return assist.GetWordsList(detected, 1, 1, 1, assist.auto_EvilMode,
+        assist.auto_EvilModeV2, assist.yandere_autoEvilInputV2.Text,
+        assist.auto_EvilModeV3, assist.yandere_autoEvilInputV3_1.Text,
+        assist.yandere_autoEvilInputV3_2.Text, assist.yandere_autoEvilInputV3_3.Text,
+        nil, true, true, true, assist.strategyMode)
 end
 
 function assist.RefreshAutomaticTrapStage(onlyTurnarounds)
-    assist.spamSuffixes = {}
-    assist.spamSuffixIndex = 1
     if onlyTurnarounds then
         assist.trapWordCache = {}
         assist.trapActiveCache = {}
@@ -2503,7 +2744,9 @@ function assist.RefreshAutomaticTrapStage(onlyTurnarounds)
     if assist.RenderTrapSliders then assist.RenderTrapSliders() end
     if onlyTurnarounds then
         if assist.UpdateAutoStatus then assist.UpdateAutoStatus() end
-        if updateSearchResults then task.spawn(updateSearchResults) end
+        if updateSearchResults and assist.yandereSearchTab and assist.yandereSearchTab.Visible then
+            task.spawn(updateSearchResults)
+        end
         if assist.sidebarEnabled and updateSidebar and assist.lastSidebarQuery ~= "-1" then
             updateSidebar(assist.lastSidebarQuery)
         end
@@ -2514,11 +2757,139 @@ end
 
 function assist.UpdateSpamStatus()
     assist.spamCurrentSuffix = assist.spamSuffixes[assist.spamSuffixIndex] or assist.spamSuffixes[1]
-    if assist.spamStatusLabel then assist.spamStatusLabel.Text = ""; assist.spamStatusLabel.Visible = false end
+    if assist.spamStatusLabel then
+        assist.spamStatusLabel.Text = #assist.spamSuffixes > 0 and ("Selected spams: " .. table.concat(assist.spamSuffixes, ", ")) or ""
+        assist.spamStatusLabel.Visible = #assist.spamSuffixes > 0
+    end
     if assist.railSpamStatus then assist.railSpamStatus.Text = ""; assist.railSpamStatus.Visible = false end
     if assist.searchSpamModeBtn then assist.searchSpamModeBtn.Text = "  Focus Mode: " .. (assist.spamSearchEnabled and "ON" or "OFF") end
-    if assist.sbSpamToggle then assist.sbSpamToggle.Text = "  Focus Mode: " .. (assist.spamRadarEnabled and "ON" or "OFF") end
+    if assist.sbSpamToggle then assist.sbSpamToggle.Text = "  Spam Mode: " .. (assist.spamRadarEnabled and "ON" or "OFF") .. " (" .. #assist.spamSuffixes .. ")" end
 end
+
+function assist.ParseSpamSuffixes(text)
+    local suffixes, seen = {}, {}
+    for token in tostring(text or ""):gmatch("[^,%s;|]+") do
+        local suffix = assist.NormalizeWordText(token)
+        if suffix ~= "" and not seen[suffix] then
+            seen[suffix] = true
+            suffixes[#suffixes + 1] = suffix
+        end
+    end
+    return suffixes
+end
+
+function assist.SetSpamSuffixes(suffixes)
+    table.clear(assist.spamSuffixes)
+    for _, suffix in ipairs(suffixes) do assist.spamSuffixes[#assist.spamSuffixes + 1] = suffix end
+    assist.spamSuffixIndex = 1
+    if assist.spamSelectionBox then assist.spamSelectionBox.Text = table.concat(assist.spamSuffixes, ", ") end
+    assist.autoAttemptKey = ""
+    assist.autoSuggestionLastKey = ""
+    assist.UpdateSpamStatus()
+    assist.TriggerAllRefreshes()
+end
+
+function assist.GetActiveSpamSuffixes(text)
+    local suffixes = assist.ParseSpamSuffixes(text)
+    local seen = {}
+    for _, suffix in ipairs(suffixes) do seen[suffix] = true end
+    for _, suffix in ipairs(assist.spamSuffixes) do
+        if not seen[suffix] then
+            seen[suffix] = true
+            suffixes[#suffixes + 1] = suffix
+        end
+    end
+    return suffixes
+end
+
+function assist.GenerateSpamCandidates(version)
+    local counts = {}
+    for index, word in ipairs(assist.dictionary) do
+        if assist.IsWordAllowedByMode(word) then
+            for length = 2, math.min(4, #word - 1) do
+                local prefix, suffix = string_sub(word, 1, length), string_sub(word, -length)
+                if prefix:match("^[a-z]+$") then
+                    local entry = counts[prefix] or {Suffix = prefix, Givers = 0, Solves = 0}
+                    entry.Solves = entry.Solves + 1
+                    counts[prefix] = entry
+                end
+                if prefix ~= suffix and suffix:match("^[a-z]+$") then
+                    local entry = counts[suffix] or {Suffix = suffix, Givers = 0, Solves = 0}
+                    entry.Givers = entry.Givers + 1
+                    counts[suffix] = entry
+                end
+            end
+        end
+        if index % 4000 == 0 then
+            task.wait()
+            if version ~= assist.dictionaryVersion or not assist.running then return nil end
+        end
+    end
+    local candidates = {}
+    for _, entry in pairs(counts) do
+        if entry.Givers >= 25 and entry.Solves >= 25 and entry.Givers > entry.Solves then
+            candidates[#candidates + 1] = entry
+        end
+    end
+    table.sort(candidates, function(a, b)
+        local marginA, marginB = a.Givers - a.Solves, b.Givers - b.Solves
+        if marginA ~= marginB then return marginA > marginB end
+        if a.Givers ~= b.Givers then return a.Givers > b.Givers end
+        return a.Suffix < b.Suffix
+    end)
+    return candidates
+end
+
+function assist.RenderSpamCandidates(candidates)
+    for _, child in ipairs(assist.spamGeneratorTab:GetChildren()) do
+        if child.Name == "GeneratedSpamRow" then child:Destroy() end
+    end
+    local selected = {}
+    for _, suffix in ipairs(assist.spamSuffixes) do selected[suffix] = true end
+    for index = 1, math.min(40, #candidates) do
+        local candidate = candidates[index]
+        local button = assist.makeBtn((selected[candidate.Suffix] and "[ON] " or "[  ] ")
+            .. candidate.Suffix:upper() .. "   " .. candidate.Givers .. " givers / " .. candidate.Solves .. " solves",
+            assist.spamGeneratorTab)
+        button.Parent.Name = "GeneratedSpamRow"
+        button.Parent.LayoutOrder = 100 + index
+        button.BackgroundColor3 = selected[candidate.Suffix] and assist.currentAccentColor or assist.panelColor
+        button.TextColor3 = selected[candidate.Suffix] and Color3.fromRGB(0, 0, 0) or assist.primaryTextColor
+        button.MouseButton1Click:Connect(function()
+            local chosen, found = {}, false
+            for _, suffix in ipairs(assist.spamSuffixes) do
+                if suffix == candidate.Suffix then found = true else chosen[#chosen + 1] = suffix end
+            end
+            if not found then chosen[#chosen + 1] = candidate.Suffix end
+            assist.SetSpamSuffixes(chosen)
+            assist.RenderSpamCandidates(candidates)
+        end)
+    end
+    assist.spamGeneratorStatus.Text = #candidates .. " spams meet the 25/25 rule. Showing the top "
+        .. math.min(40, #candidates) .. ". Tap several to select them."
+end
+
+assist.spamApplyBtn.MouseButton1Click:Connect(function()
+    assist.SetSpamSuffixes(assist.ParseSpamSuffixes(assist.spamSelectionBox.Text))
+end)
+
+assist.spamGenerateBtn.MouseButton1Click:Connect(function()
+    if assist.spamGeneratorRunning then return end
+    if #assist.dictionary == 0 then
+        assist.spamGeneratorStatus.Text = "Load the dictionary first."
+        return
+    end
+    assist.spamGeneratorRunning = true
+    assist.spamGeneratorStatus.Text = "Counting givers and solves..."
+    local version = assist.dictionaryVersion
+    task.spawn(function()
+        local candidates = assist.GenerateSpamCandidates(version)
+        assist.spamGeneratorRunning = false
+        if candidates and version == assist.dictionaryVersion then
+            assist.RenderSpamCandidates(candidates)
+        end
+    end)
+end)
 
 function assist.FindSpamWord(detected, suffix)
     detected = assist.NormalizeWordText(tostring(detected or ""))
@@ -2533,7 +2904,7 @@ function assist.FindSpamWord(detected, suffix)
     local best = nil
     local bestRank = nil
     for _, word in ipairs(source) do
-        if assist.IsWordAllowedByMode(word) and not assist.IsWordSuppressed(word) and not assist.usedWords[word] and not assist.pendingWords[word] and not assist.rejectedWords[word] then
+        if assist.IsWordAllowedByMode(word) and not assist.IsWordSuppressed(word) and not assist.usedWords[word] and not assist.sessionBlockedWords[word] and not assist.attemptedWords[word] and not assist.pendingWords[word] and not assist.rejectedWords[word] then
             local valid = true
             if assist.auto_MatchMode == 1 then valid = string_sub(word, 1, #detected) == detected
             elseif assist.auto_MatchMode == 2 then valid = string_find(word, detected, 1, true) ~= nil
@@ -2603,20 +2974,39 @@ updateSearchResults = function()
         if assist.oneByOneEnabled then
             m = assist.GetOneByOneRankedWords(q, 28)
         else
-            for _, w in ipairs(assist.dictionary) do
-                count = count + 1; if count % 20000 == 0 then task.wait(); if ver ~= assist.searchUpdateVersion then return end end
-                if assist.IsWordAllowedByMode(w) and not assist.IsWordSuppressed(w) then
-                    local valid = true
-                    if q ~= "" then
-                        if assist.search_MatchMode == 1 then if string_sub(w, 1, #q) ~= q then valid = false end
-                        elseif assist.search_MatchMode == 2 then if not string_find(w, q, 1, true) then valid = false end
-                        elseif assist.search_MatchMode == 3 then if string_sub(w, -#q) ~= q then valid = false end end
+            local function collectMatches(ignoreStrategy, ignoreEnding)
+                for _, w in ipairs(assist.dictionary) do
+                    count = count + 1
+                    if count % 20000 == 0 then
+                        task.wait()
+                        if ver ~= assist.searchUpdateVersion then return false end
                     end
-                    if valid then valid = assist.MatchesEndingFilter(w, assist.search_EvilMode, assist.search_EvilModeV2, v2, assist.search_EvilModeV3, v3_1, v3_2, v3_3) end
-                    if valid and assist.strategyMode == 2 then valid = assist.IsGenerousWord(w) end
-                    if valid and assist.strategyMode == 3 then valid = assist.IsEvilWord(w) end
-                    if valid then table.insert(m, w) end
+                    if assist.IsWordAllowedByMode(w) and not assist.IsWordSuppressed(w) then
+                        local valid = true
+                        if q ~= "" then
+                            if assist.search_MatchMode == 1 then valid = string_sub(w, 1, #q) == q
+                            elseif assist.search_MatchMode == 2 then valid = string_find(w, q, 1, true) ~= nil
+                            elseif assist.search_MatchMode == 3 then valid = string_sub(w, -#q) == q end
+                        end
+                        if valid and not ignoreEnding then
+                            valid = assist.MatchesEndingFilter(w, assist.search_EvilMode, assist.search_EvilModeV2, v2,
+                                assist.search_EvilModeV3, v3_1, v3_2, v3_3)
+                        end
+                        if valid and not ignoreStrategy then
+                            if valid and assist.strategyMode == 2 then valid = assist.IsGenerousWord(w) end
+                            if valid and assist.strategyMode == 3 then valid = assist.IsEvilWord(w) end
+                        end
+                        if valid then table.insert(m, w) end
+                    end
                 end
+                return true
+            end
+            if not collectMatches(false, false) then return end
+            if #m == 0 and assist.strategyMode ~= 1 then
+                if not collectMatches(true, false) then return end
+            end
+            if #m == 0 and not (assist.search_EvilModeV2 and assist.NormalizeWordText(v2) ~= "") then
+                if not collectMatches(true, true) then return end
             end
         end
         if ver ~= assist.searchUpdateVersion then return end
@@ -2679,12 +3069,12 @@ function assist.GetCol(isOn) return isOn and assist.currentAccentColor or assist
 function assist.GetTxtCol(isOn) return isOn and Color3.fromRGB(0, 0, 0) or Color3.fromRGB(255, 255, 255) end
 
 assist.yandere_autoTypeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.isAutoTypeEnabled = not assist.isAutoTypeEnabled; assist.autoAttemptKey = ""; assist.yandere_autoTypeBtn.Text = "  Auto type: " .. (assist.isAutoTypeEnabled and "ON" or "OFF"); assist.yandere_autoTypeBtn.BackgroundColor3 = assist.GetCol(assist.isAutoTypeEnabled); assist.yandere_autoTypeBtn.TextColor3 = assist.GetTxtCol(assist.isAutoTypeEnabled) end)
-assist.tsundere_autoSpeedBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.auto_SpeedMode = assist.auto_SpeedMode + 1; if assist.auto_SpeedMode > 4 then assist.auto_SpeedMode = 1 end; assist.tsundere_autoSpeedBtn.Text = "  Typing Speed: " .. assist.speedNames[assist.auto_SpeedMode]; assist.currentCPM = (assist.auto_SpeedMode==1) and 150 or (assist.auto_SpeedMode==2) and 400 or (assist.auto_SpeedMode==3) and 750 or 3000 end)
+assist.tsundere_autoSpeedBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.auto_SpeedMode = assist.auto_SpeedMode + 1; if assist.auto_SpeedMode > #assist.speedNames then assist.auto_SpeedMode = 1 end; assist.tsundere_autoSpeedBtn.Text = "  Typing Speed: " .. assist.speedNames[assist.auto_SpeedMode]; assist.currentCPM = (assist.auto_SpeedMode==1) and 150 or (assist.auto_SpeedMode==2) and 400 or (assist.auto_SpeedMode==3) and 750 or (assist.auto_SpeedMode==4) and 3000 or 12000 end)
 assist.yandere_autoMistakeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.auto_MakeMistakes = not assist.auto_MakeMistakes; assist.yandere_autoMistakeBtn.Text = "  Typing mistakes: " .. (assist.auto_MakeMistakes and "ON" or "OFF"); assist.yandere_autoMistakeBtn.BackgroundColor3 = assist.GetCol(assist.auto_MakeMistakes); assist.yandere_autoMistakeBtn.TextColor3 = assist.GetTxtCol(assist.auto_MakeMistakes) end)
 assist.humanizeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.humanizeEnabled = not assist.humanizeEnabled; assist.humanizeBtn.Text = "  Natural timing: " .. (assist.humanizeEnabled and "ON" or "OFF"); assist.humanizeBtn.BackgroundColor3 = assist.GetCol(assist.humanizeEnabled); assist.humanizeBtn.TextColor3 = assist.GetTxtCol(assist.humanizeEnabled) end)
 assist.autoTrapBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.autoTrapEnabled = not assist.autoTrapEnabled; assist.autoTrapBtn.Text = "  Trap help: " .. (assist.autoTrapEnabled and "ON" or "OFF"); assist.autoTrapBtn.BackgroundColor3 = assist.GetCol(assist.autoTrapEnabled); assist.autoTrapBtn.TextColor3 = assist.GetTxtCol(assist.autoTrapEnabled) end)
 assist.autoSuggestionBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.autoSuggestionEnabled = not assist.autoSuggestionEnabled; assist.autoSuggestionBtn.Text = "  Word hint: " .. (assist.autoSuggestionEnabled and "ON" or "OFF"); assist.autoSuggestionBtn.BackgroundColor3 = assist.GetCol(assist.autoSuggestionEnabled); assist.autoSuggestionBtn.TextColor3 = assist.GetTxtCol(assist.autoSuggestionEnabled); if assist.autoSuggestionEnabled then assist.autoSuggestionLastKey = "" else assist.HideAutomaticSuggestion() end end)
-assist.spamModeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.spamModeEnabled = not assist.spamModeEnabled; assist.spamModeBtn.Text = "  Focus Mode: " .. (assist.spamModeEnabled and "ON" or "OFF"); assist.spamModeBtn.BackgroundColor3 = assist.GetCol(assist.spamModeEnabled); assist.spamModeBtn.TextColor3 = assist.GetTxtCol(assist.spamModeEnabled); assist.autoAttemptKey = ""; assist.UpdateSpamStatus() end)
+assist.spamModeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.spamModeEnabled = not assist.spamModeEnabled; assist.spamModeBtn.Text = "  Spam Mode: " .. (assist.spamModeEnabled and "ON" or "OFF"); assist.spamModeBtn.BackgroundColor3 = assist.GetCol(assist.spamModeEnabled); assist.spamModeBtn.TextColor3 = assist.GetTxtCol(assist.spamModeEnabled); assist.aV2F.Visible = assist.spamModeEnabled or assist.auto_EvilModeV2; assist.autoAttemptKey = ""; assist.autoSuggestionLastKey = ""; assist.HideAutomaticSuggestion(); assist.UpdateSpamStatus() end)
 local function cycleWordStrategy()
     assist.playPop()
     assist.strategyMode = assist.strategyMode % #assist.strategyNames + 1
@@ -2741,7 +3131,7 @@ end)
 assist.tsundere_autoMatchModeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.auto_MatchMode = assist.auto_MatchMode % 3 + 1; assist.tsundere_autoMatchModeBtn.Text = "  Match: " .. assist.matchNames[assist.auto_MatchMode]; assist.TriggerAllRefreshes() end)
 assist.tsundere_autoSortModeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.auto_SortMode = assist.auto_SortMode % 3 + 1; assist.tsundere_autoSortModeBtn.Text = "  Sort: " .. assist.sortNames[assist.auto_SortMode]; assist.TriggerAllRefreshes() end)
 assist.yandere_autoEvilModeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.auto_EvilMode = not assist.auto_EvilMode; assist.yandere_autoEvilModeBtn.Text = "  Hard endings (x, z, q, j, v): " .. (assist.auto_EvilMode and "ON" or "OFF"); assist.yandere_autoEvilModeBtn.BackgroundColor3 = assist.GetCol(assist.auto_EvilMode); assist.yandere_autoEvilModeBtn.TextColor3 = assist.GetTxtCol(assist.auto_EvilMode); assist.TriggerAllRefreshes() end)
-assist.yandere_autoEvilModeV2Btn.MouseButton1Click:Connect(function() assist.playPop(); assist.auto_EvilModeV2 = not assist.auto_EvilModeV2; assist.yandere_autoEvilModeV2Btn.Text = "  Ending filter: " .. (assist.auto_EvilModeV2 and "ON" or "OFF"); assist.yandere_autoEvilModeV2Btn.BackgroundColor3 = assist.GetCol(assist.auto_EvilModeV2); assist.yandere_autoEvilModeV2Btn.TextColor3 = assist.GetTxtCol(assist.auto_EvilModeV2); assist.aV2F.Visible = assist.auto_EvilModeV2; assist.TriggerAllRefreshes() end)
+assist.yandere_autoEvilModeV2Btn.MouseButton1Click:Connect(function() assist.playPop(); assist.auto_EvilModeV2 = not assist.auto_EvilModeV2; assist.yandere_autoEvilModeV2Btn.Text = "  Ending filter: " .. (assist.auto_EvilModeV2 and "ON" or "OFF"); assist.yandere_autoEvilModeV2Btn.BackgroundColor3 = assist.GetCol(assist.auto_EvilModeV2); assist.yandere_autoEvilModeV2Btn.TextColor3 = assist.GetTxtCol(assist.auto_EvilModeV2); assist.aV2F.Visible = assist.auto_EvilModeV2 or assist.spamModeEnabled; assist.TriggerAllRefreshes() end)
 assist.yandere_autoEvilModeV3Btn.MouseButton1Click:Connect(function() assist.playPop(); assist.auto_EvilModeV3 = not assist.auto_EvilModeV3; assist.yandere_autoEvilModeV3Btn.Text = "  More ending filters: " .. (assist.auto_EvilModeV3 and "ON" or "OFF"); assist.yandere_autoEvilModeV3Btn.BackgroundColor3 = assist.GetCol(assist.auto_EvilModeV3); assist.yandere_autoEvilModeV3Btn.TextColor3 = assist.GetTxtCol(assist.auto_EvilModeV3); assist.v3CA.Visible = assist.auto_EvilModeV3; assist.TriggerAllRefreshes() end)
 assist.searchMatchModeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.search_MatchMode = assist.search_MatchMode % 3 + 1; assist.searchMatchModeBtn.Text = "  Search Match: " .. assist.matchNames[assist.search_MatchMode]; assist.TriggerAllRefreshes() end)
 assist.searchSortModeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.search_SortMode = assist.search_SortMode % 3 + 1; assist.searchSortModeBtn.Text = "  Search Sort: " .. assist.sortNames[assist.search_SortMode]; assist.TriggerAllRefreshes() end)
@@ -2755,7 +3145,7 @@ function assist.checkMod(p) if assist.antiModEnabled and p ~= player then local 
 assist.antiModBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.antiModEnabled = not assist.antiModEnabled; assist.antiModBtn.Text = "  Anti-Mod Auto-Kick: " .. (assist.antiModEnabled and "ON" or "OFF"); assist.antiModBtn.BackgroundColor3 = assist.GetCol(assist.antiModEnabled); assist.antiModBtn.TextColor3 = assist.GetTxtCol(assist.antiModEnabled); if assist.antiModEnabled then for _, p in ipairs(Players:GetPlayers()) do assist.checkMod(p) end end end)
 assist.SafeConnect(Players.PlayerAdded, assist.checkMod)
 assist.yandere_dupeBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.hideUsed = not assist.hideUsed; assist.yandere_dupeBtn.Text = "  Hide Used Words: " .. (assist.hideUsed and "ON" or "OFF") .. " (" .. assist.usedCount .. ")"; assist.yandere_dupeBtn.BackgroundColor3 = assist.GetCol(assist.hideUsed); assist.yandere_dupeBtn.TextColor3 = assist.GetTxtCol(assist.hideUsed); assist.TriggerAllRefreshes() end)
-assist.refreshDupesBtn.MouseButton1Click:Connect(function() assist.playPop(); table.clear(assist.usedWords); table.clear(assist.softBlockedWords); assist.turnVersion = assist.turnVersion + 1; assist.typingGeneration = assist.typingGeneration + 1; assist.isTyping = false; assist.InvalidateTrapState(); assist.lastWordInTurn = ""; assist.lastCompleteWordInTurn = ""; assist.turnPrompt = ""; assist.savedTurnPrompt = ""; assist.savedPromptTurnVersion = -1; table.clear(assist.pendingWords); table.clear(assist.rejectedWords); assist.usedCount = 0; assist.lastSubmittedWord = nil; assist.lastSubmittedPrefix = ""; assist.lastSubmittedDisplayLength = 0; assist.lastSubmittedTypedCount = 0; assist.lastSubmissionWasAuto = false; assist.manualSubmittedWord = nil; assist.autoAttemptKey = ""; assist.HideAutomaticSuggestion(); assist.yandere_dupeBtn.Text = "  Hide Used Words: " .. (assist.hideUsed and "ON" or "OFF") .. " (0)"; assist.ToastNotification("USED WORDS", "Used-word memory cleared.", assist.currentAccentColor); assist.TriggerAllRefreshes() end)
+assist.refreshDupesBtn.MouseButton1Click:Connect(function() assist.playPop(); table.clear(assist.usedWords); table.clear(assist.attemptedWords); table.clear(assist.sessionBlockedWords); table.clear(assist.softBlockedWords); assist.turnVersion = assist.turnVersion + 1; assist.typingGeneration = assist.typingGeneration + 1; assist.isTyping = false; assist.InvalidateTrapState(); assist.lastWordInTurn = ""; assist.lastCompleteWordInTurn = ""; assist.turnPrompt = ""; assist.savedTurnPrompt = ""; assist.savedPromptTurnVersion = -1; table.clear(assist.pendingWords); table.clear(assist.rejectedWords); assist.usedCount = 0; assist.lastSubmittedWord = nil; assist.lastSubmittedPrefix = ""; assist.lastSubmittedDisplayLength = 0; assist.lastSubmittedTypedCount = 0; assist.lastSubmissionWasAuto = false; assist.manualSubmittedWord = nil; assist.autoAttemptKey = ""; assist.HideAutomaticSuggestion(); assist.yandere_dupeBtn.Text = "  Hide Used Words: " .. (assist.hideUsed and "ON" or "OFF") .. " (0)"; assist.ToastNotification("USED WORDS", "Session word memory cleared.", assist.currentAccentColor); assist.TriggerAllRefreshes() end)
 assist.highlightProsBtn.MouseButton1Click:Connect(function() assist.playPop(); assist.highlightExecutorsEnabled = not assist.highlightExecutorsEnabled; assist.highlightProsBtn.Text = "  Player and Turn Highlight: " .. (assist.highlightExecutorsEnabled and "ON" or "OFF"); assist.highlightProsBtn.BackgroundColor3 = assist.GetCol(assist.highlightExecutorsEnabled); assist.highlightProsBtn.TextColor3 = assist.GetTxtCol(assist.highlightExecutorsEnabled); assist.UpdateTurnHighlights(); if assist.highlightExecutorsEnabled then assist.ToastNotification("HIGHLIGHT SYSTEM", "Player highlights enabled.", assist.currentAccentColor) end end)
 assist.sidebarBtn.MouseButton1Click:Connect(function()
     assist.playPop()
@@ -2857,7 +3247,11 @@ assist.SafeConnect(UserInputService.InputBegan, function(i, gp)
                 
                 assist.manualSubmittedWord = instantWord
                 assist.lastSubmissionFeedback = assist.GetWrongAnswerReason()
-                assist.QueuePendingWord(instantWord, true)
+                local queuedWord = assist.QueuePendingWord(instantWord, true)
+                if queuedWord then
+                    assist.attemptedWords[queuedWord] = true
+                    assist.sessionBlockedWords[queuedWord] = true
+                end
             end
             if assist.autoSuggestionWord and assist.manualSubmittedWord == assist.autoSuggestionWord then assist.HideAutomaticSuggestion() end
         end
@@ -2882,24 +3276,30 @@ function assist.ClearRadarRows()
     end
 end
 
-function assist.RenderRadarMatches(matches, query)
+function assist.RenderRadarMatches(matches, query, fallbackSuffix)
     assist.ClearRadarRows()
-    assist.radarStatus.Visible = #matches == 0
-    assist.radarStatus.Text = (#matches == 0) and (query == "" and "Waiting for letters..."
-        or (assist.oneByOneEnabled and assist.oneByOneComputing[assist.GetOneByOneKey(query)] and "CALCULATING BEST MOVE..." or "NO SUGGESTIONS FOUND")) or ""
+    assist.radarStatus.Visible = #matches == 0 or fallbackSuffix ~= nil
+    assist.radarStatus.Text = fallbackSuffix and ("No " .. fallbackSuffix:upper() .. " ending; shortest solves shown")
+        or ((#matches == 0) and (query == "" and "Waiting for letters..."
+        or (assist.oneByOneEnabled and assist.oneByOneComputing[assist.GetOneByOneKey(query)] and "CALCULATING BEST MOVE..." or "NO SUGGESTIONS FOUND")) or "")
 
     for index, w in ipairs(matches) do
-        local f = Instance.new("Frame")
+        local f = Instance.new("ScrollingFrame")
         f.Name = "RadarRow"
         f:SetAttribute("SatWord", w)
         f.Size = UDim2.new(1, 0, 0, 40)
         f.BackgroundTransparency = 1
+        f.BorderSizePixel = 0
+        f.ScrollingDirection = Enum.ScrollingDirection.X
+        f.ScrollBarThickness = 3
+        f.ScrollBarImageColor3 = assist.currentAccentColor
+        f.ClipsDescendants = true
         f.LayoutOrder = index + 1
         f.ZIndex = 122
         f.Parent = sidebarResults
 
         local b = Instance.new("TextButton")
-        b.Size = UDim2.new(1, 0, 1, 0)
+        b.Size = UDim2.new(1, 0, 1, -3)
         b.BackgroundColor3 = assist.panelColor
         b.BorderSizePixel = 0
         b.AutoButtonColor = false
@@ -2944,16 +3344,141 @@ function assist.RenderRadarMatches(matches, query)
         txt.TextSize = 22
         txt.Font = Enum.Font.GothamBold
         txt.TextXAlignment = Enum.TextXAlignment.Left
-        txt.TextTruncate = Enum.TextTruncate.AtEnd
+        txt.TextTruncate = Enum.TextTruncate.None
+        txt.TextWrapped = false
         txt.TextColor3 = Color3.fromRGB(255, 255, 255)
         txt.ZIndex = 124
         txt.Parent = b
+        local plainWord = coloredWord:gsub("<[^>]->", "")
+        local measuredWidth = TextService:GetTextSize(plainWord, txt.TextSize, txt.Font, Vector2.new(100000, 40)).X
+        local rowWidth = math.max(sidebarResults.AbsoluteSize.X - 20, measuredWidth + 36)
+        b.Size = UDim2.new(0, rowWidth, 1, -3)
+        f.CanvasSize = UDim2.fromOffset(rowWidth, 0)
 
         b.MouseButton1Click:Connect(function()
             assist.playPop()
-            task.spawn(function() assist.TypeWord(w, query) end)
+            task.spawn(function() assist.TypeWord(w, query, false, fallbackSuffix ~= nil) end)
         end)
     end
+end
+
+function assist.GetShortestRadarSolves(query, maxCount, shouldCancel)
+    local results = {}
+    local limit = maxCount or 30
+    local source = assist.radarPrefixIndex[string_sub(query, 1, math.min(2, #query))] or {}
+    for index, word in ipairs(source) do
+        if index % 5000 == 0 then
+            if shouldCancel and shouldCancel() then return nil end
+            task.wait()
+        end
+        if #word > #query and string_sub(word, 1, #query) == query
+            and assist.IsWordAllowedByMode(word)
+            and not assist.IsWordUnavailable(word, true) then
+            local worst = results[#results]
+            if #results < limit or #word < #worst or (#word == #worst and word < worst) then
+                local position = #results + 1
+                for i, existing in ipairs(results) do
+                    if #word < #existing or (#word == #existing and word < existing) then
+                        position = i
+                        break
+                    end
+                end
+                table_insert(results, position, word)
+                if #results > limit then table.remove(results) end
+            end
+        end
+    end
+    if shouldCancel and shouldCancel() then return nil end
+    return results
+end
+
+function assist.GetMultiSpamMatches(query, suffixes, maxCount, shouldCancel)
+    local limit = maxCount or 30
+    local source = assist.radarPrefixIndex[string_sub(query, 1, math.min(2, #query))] or {}
+    local buckets, fallback = {}, {}
+    for index = 1, #suffixes do buckets[index] = {} end
+    local function better(a, b)
+        if assist.autoTrapEnabled then
+            local rankA, rankB = assist.GetWordTrapInfo(a).Rank, assist.GetWordTrapInfo(b).Rank
+            if rankA ~= rankB then return rankA > rankB end
+        end
+        if assist.auto_SortMode == 2 then
+            if #a ~= #b then return #a > #b end
+        elseif assist.auto_SortMode == 3 then
+            local scoreA, scoreB = assist.GetKillerScore(a), assist.GetKillerScore(b)
+            if scoreA ~= scoreB then return scoreA > scoreB end
+        else
+            local scoreA, scoreB = assist.GetSmartScore(a), assist.GetSmartScore(b)
+            if scoreA ~= scoreB then return scoreA > scoreB end
+        end
+        if #a ~= #b then return #a < #b end
+        return a < b
+    end
+    local function insertBest(bucket, word)
+        if #bucket >= limit and not better(word, bucket[#bucket]) then return end
+        local position = #bucket + 1
+        for index, existing in ipairs(bucket) do
+            if better(word, existing) then position = index; break end
+        end
+        table_insert(bucket, position, word)
+        if #bucket > limit then table.remove(bucket) end
+    end
+    local function insertShortest(word)
+        local worst = fallback[#fallback]
+        if #fallback >= limit and not (#word < #worst or (#word == #worst and word < worst)) then return end
+        local position = #fallback + 1
+        for index, existing in ipairs(fallback) do
+            if #word < #existing or (#word == #existing and word < existing) then position = index; break end
+        end
+        table_insert(fallback, position, word)
+        if #fallback > limit then table.remove(fallback) end
+    end
+    for index, word in ipairs(source) do
+        if index % 5000 == 0 then
+            if shouldCancel and shouldCancel() then return nil, nil end
+            task.wait()
+        end
+        if #word > #query and string_sub(word, 1, #query) == query
+            and assist.IsWordAllowedByMode(word) and not assist.IsWordUnavailable(word, true) then
+            insertShortest(word)
+            if not assist.IsSelfSolveWord(word, query) then
+                for suffixIndex, suffix in ipairs(suffixes) do
+                    if #word >= #suffix and string_sub(word, -#suffix) == suffix then
+                        insertBest(buckets[suffixIndex], word)
+                        break
+                    end
+                end
+            end
+        end
+    end
+    if shouldCancel and shouldCancel() then return nil, nil end
+    local matches, seen = {}, {}
+    for _, bucket in ipairs(buckets) do
+        for _, word in ipairs(bucket) do
+            if not seen[word] then
+                seen[word] = true
+                matches[#matches + 1] = word
+                if #matches >= limit then return matches, fallback end
+            end
+        end
+    end
+    return matches, fallback
+end
+
+function assist.GetAutoSpamSuffixes()
+    local text = assist.yandere_autoEvilInputV2.Text
+    if assist.NormalizeWordText(text) == "" and assist.sidebar_EvilModeV2 and assist.sbEBox then
+        text = assist.sbEBox.Text
+    end
+    return assist.GetActiveSpamSuffixes(text)
+end
+
+function assist.GetAutoSpamCandidate(prompt)
+    local suffixes = assist.GetAutoSpamSuffixes()
+    if #suffixes == 0 then return nil, false end
+    local matches, fallback = assist.GetMultiSpamMatches(prompt, suffixes, 1)
+    if matches and matches[1] then return matches[1], false end
+    return fallback and fallback[1] or nil, true
 end
 
 updateSidebar = function(query)
@@ -2979,13 +3504,32 @@ updateSidebar = function(query)
             local currentVersion = assist.radarUpdateVersion
             local currentQuery = assist.radarRequestedQuery
             local v2Suffix = assist.sidebar_EvilModeV2 and assist.sbEBox.Text or ""
-            local ok, matches = pcall(function()
+            local ok, matches, fallbackSuffix = pcall(function()
                 if assist.oneByOneEnabled then
                     return assist.GetOneByOneRankedWords(currentQuery, 8)
                 end
-                return assist.GetWordsList(currentQuery, 30, 1, assist.auto_SortMode, false, assist.sidebar_EvilModeV2, v2Suffix, false, "", "", "", function()
+                local cancelled = function()
                     return currentVersion ~= assist.radarUpdateVersion or not assist.sidebarEnabled
-                end, false, false, false, assist.strategyMode)
+                end
+                if assist.spamRadarEnabled then
+                    local suffixes = assist.GetActiveSpamSuffixes(v2Suffix)
+                    if #suffixes > 0 then
+                        local spamMatches, shortest = assist.GetMultiSpamMatches(currentQuery, suffixes, 30, cancelled)
+                        if not spamMatches then return nil end
+                        if #spamMatches == 0 then
+                            return shortest, #shortest > 0 and table.concat(suffixes, ", ") or nil
+                        end
+                        return spamMatches
+                    end
+                end
+                local words = assist.GetWordsList(currentQuery, 30, 1, assist.auto_SortMode, false, assist.sidebar_EvilModeV2, v2Suffix, false, "", "", "", cancelled, false, assist.spamRadarEnabled, false, assist.strategyMode)
+                if not words then return nil end
+                if assist.spamRadarEnabled and #words == 0 then
+                    words = assist.GetShortestRadarSolves(currentQuery, 30, cancelled)
+                    if not words then return nil end
+                    return words, #words > 0 and assist.NormalizeWordText(v2Suffix) ~= "" and v2Suffix or nil
+                end
+                return words
             end)
 
             if not ok then
@@ -2999,8 +3543,7 @@ updateSidebar = function(query)
             end
 
             if matches and currentVersion == assist.radarUpdateVersion and assist.sidebarEnabled then
-                if assist.spamRadarEnabled and not assist.oneByOneEnabled then matches = select(1, assist.FilterSpamMatches(matches)) end
-                assist.RenderRadarMatches(matches, currentQuery)
+                assist.RenderRadarMatches(matches, currentQuery, fallbackSuffix)
             end
 
             if currentVersion == assist.radarUpdateVersion then
@@ -3036,7 +3579,7 @@ end)
 
 function assist.OnMatchStart()
     assist.oneByOneSubmittedTurn = nil
-    table.clear(assist.usedWords); table.clear(assist.softBlockedWords); assist.turnVersion = assist.turnVersion + 1; assist.typingGeneration = assist.typingGeneration + 1; assist.isTyping = false; assist.InvalidateTrapState(); assist.lastWordInTurn = ""; assist.lastCompleteWordInTurn = ""; assist.turnPrompt = ""; assist.savedTurnPrompt = ""; assist.savedPromptTurnVersion = -1
+    table.clear(assist.usedWords); table.clear(assist.attemptedWords); table.clear(assist.softBlockedWords); assist.turnVersion = assist.turnVersion + 1; assist.typingGeneration = assist.typingGeneration + 1; assist.isTyping = false; assist.InvalidateTrapState(); assist.lastWordInTurn = ""; assist.lastCompleteWordInTurn = ""; assist.turnPrompt = ""; assist.savedTurnPrompt = ""; assist.savedPromptTurnVersion = -1
     table.clear(assist.pendingWords)
     table.clear(assist.rejectedWords)
     assist.usedCount = 0
@@ -3044,6 +3587,11 @@ function assist.OnMatchStart()
     assist.lastBlockedSource = ""
     assist.lastBlockedAt = 0
     assist.lastSeenGameWord = ""
+    assist.lastCapturedVisibleWord = ""
+    assist.wordChangesInTurn = {}
+    assist.promptSamples = {}
+    assist.promptResolutionCache = {}
+    assist.promptRejectedReadings = {}
     assist.previousTurnWord = ""
     assist.longestWordInTurn = ""
     assist.lastSubmittedWord = nil
@@ -3072,7 +3620,7 @@ function assist.OnMatchEnd()
     assist.oneByOneSubmittedTurn = nil
     assist.wasInMatch = false
     assist.matchEndTimer = nil
-    table.clear(assist.usedWords); table.clear(assist.softBlockedWords); assist.turnVersion = assist.turnVersion + 1; assist.typingGeneration = assist.typingGeneration + 1; assist.isTyping = false; assist.InvalidateTrapState(); assist.lastWordInTurn = ""; assist.lastCompleteWordInTurn = ""; assist.turnPrompt = ""; assist.savedTurnPrompt = ""; assist.savedPromptTurnVersion = -1
+    table.clear(assist.usedWords); table.clear(assist.attemptedWords); table.clear(assist.softBlockedWords); assist.turnVersion = assist.turnVersion + 1; assist.typingGeneration = assist.typingGeneration + 1; assist.isTyping = false; assist.InvalidateTrapState(); assist.lastWordInTurn = ""; assist.lastCompleteWordInTurn = ""; assist.turnPrompt = ""; assist.savedTurnPrompt = ""; assist.savedPromptTurnVersion = -1
     table.clear(assist.pendingWords)
     table.clear(assist.rejectedWords)
     assist.usedCount = 0
@@ -3080,6 +3628,11 @@ function assist.OnMatchEnd()
     assist.lastBlockedSource = ""
     assist.lastBlockedAt = 0
     assist.lastSeenGameWord = ""
+    assist.lastCapturedVisibleWord = ""
+    assist.wordChangesInTurn = {}
+    assist.promptSamples = {}
+    assist.promptResolutionCache = {}
+    assist.promptRejectedReadings = {}
     assist.previousTurnWord = ""
     assist.longestWordInTurn = ""
     assist.lastSubmittedWord = nil
@@ -3099,7 +3652,7 @@ function assist.OnMatchEnd()
     assist.currentTrapLength = 2
     assist.RefreshAutomaticTrapStage()
     if assist.yandere_dupeBtn then assist.yandere_dupeBtn.Text = "  Hide Used Words: " .. (assist.hideUsed and "ON" or "OFF") .. " (0)" end
-    assist.ToastNotification("MATCH OVER", "Used-word memory cleared.", assist.currentAccentColor)
+    assist.ToastNotification("MATCH OVER", "Session word memory kept.", assist.currentAccentColor)
     assist.TriggerAllRefreshes()
 end
 
@@ -3128,6 +3681,14 @@ function assist.FinishTrackedTurn()
                 word = assist.lastCompleteWordInTurn
             end
             if #word <= #assist.turnPrompt or string_sub(word, 1, #assist.turnPrompt) ~= assist.turnPrompt then word = nil end
+        end
+    end
+    if not word then
+        for _, observed in ipairs(assist.wordChangesInTurn) do
+            if #observed > #assist.turnPrompt and assist.dictionarySet[observed]
+                and (not word or #observed > #word) then
+                word = observed
+            end
         end
     end
     local completedSolve = word ~= nil and reason == nil and not assist.rejectedWords[word]
@@ -3161,28 +3722,29 @@ function assist.FinishTrackedTurn()
     return completedSolve
 end
 
-local function samePromptLetters(first, second)
-    if #first ~= #second then return false end
-    local counts = {}
-    for i = 1, #first do
-        local character = string_sub(first, i, i)
-        counts[character] = (counts[character] or 0) + 1
-    end
-    for i = 1, #second do
-        local character = string_sub(second, i, i)
-        counts[character] = (counts[character] or 0) - 1
-        if counts[character] < 0 then return false end
-    end
-    return true
-end
-
 function assist.TrackGameTurn(matchVisible, currentTurn, liveWord)
     if matchVisible then
         assist.matchEndTimer = nil
         if not assist.wasInMatch then assist.OnMatchStart() end
+        local previousVisible = assist.lastSeenGameWord
+        if previousVisible ~= "" and previousVisible ~= assist.lastCapturedVisibleWord
+            and liveWord ~= "" and #liveWord <= 4 and #previousVisible > #liveWord
+            and string_sub(previousVisible, 1, #liveWord) ~= liveWord
+            and assist.turnPrompt ~= "" and #previousVisible > #assist.turnPrompt
+            and string_sub(previousVisible, 1, #assist.turnPrompt) == assist.turnPrompt then
+            assist.lastCapturedVisibleWord = previousVisible
+            if #previousVisible >= 5 then
+                assist.BlockObservedWordFamily(previousVisible)
+            else
+                assist.RegisterWordUsed(previousVisible, false, true)
+            end
+        end
         if currentTurn and currentTurn ~= assist.lastTurnName then
             if assist.lastTurnName then
                 local wasLocalTurn = assist.lastTurnName == player.Name
+                if #assist.longestWordInTurn >= 5 then
+                    assist.BlockObservedWordFamily(assist.longestWordInTurn)
+                end
                 local previousWord = assist.lastCompleteWordInTurn
                 if not assist.dictionarySet[previousWord] then previousWord = assist.lastWordInTurn end
                 assist.previousTurnWord = assist.dictionarySet[previousWord] and previousWord or ""
@@ -3199,18 +3761,28 @@ function assist.TrackGameTurn(matchVisible, currentTurn, liveWord)
                 end
             end
             assist.lastTurnName = currentTurn
+            assist.wordChangesInTurn = {}
+            assist.promptSamples = {}
+            assist.promptResolutionCache = {}
+            assist.promptRejectedReadings = {}
         end
         if currentTurn and liveWord ~= "" then
-            if assist.turnPrompt == "" then assist.turnPrompt = liveWord end
+            if assist.wordChangesInTurn[#assist.wordChangesInTurn] ~= liveWord then
+                assist.wordChangesInTurn[#assist.wordChangesInTurn + 1] = liveWord
+                if #assist.wordChangesInTurn > 40 then table.remove(assist.wordChangesInTurn, 1) end
+            end
+            if currentTurn == player.Name and #liveWord <= 4 and not assist.isTyping
+                and not assist.lastSubmittedWord then
+                local count = (assist.promptSamples[liveWord] or 0) + 1
+                assist.promptSamples[liveWord] = count
+                if count == 2 then assist.promptResolutionCache = {} end
+            end
+            if assist.turnPrompt == "" then
+                assist.turnPrompt = currentTurn == player.Name and assist.ResolvePrompt(liveWord) or liveWord
+            end
             if currentTurn == player.Name and assist.savedTurnPrompt == ""
                 and (assist.oneByOneEnabled or #liveWord <= 4) then
-                local original = liveWord
-                local previousWord = assist.previousTurnWord
-                if not assist.oneByOneEnabled and #previousWord > #liveWord then
-                    local suffix = string_sub(previousWord, -#liveWord)
-                    if samePromptLetters(suffix, liveWord) then original = suffix end
-                end
-                assist.savedTurnPrompt = original
+                assist.savedTurnPrompt = assist.ResolvePrompt(liveWord)
                 assist.savedPromptTurnVersion = assist.turnVersion
             end
             assist.lastSeenGameWord = liveWord
@@ -3243,15 +3815,20 @@ function assist.TrackGameTurn(matchVisible, currentTurn, liveWord)
 end
 
 local lastHeartbeatCheck = 0
+local lastTurnSample = 0
+local sampledCurrentTurn = nil
 assist.SafeConnect(RunService.Heartbeat, function()
     local t = os_clock()
+    if t - lastTurnSample >= 0.025 then
+        lastTurnSample = t
+        local matchVisible = assist.GetMatchFrame() ~= nil
+        sampledCurrentTurn = assist.GetCurrentTurnPlayerName()
+        assist.TrackGameTurn(matchVisible, sampledCurrentTurn, assist.GetCurrentGameWord())
+    end
     if t - lastHeartbeatCheck < 0.1 then return end
     lastHeartbeatCheck = t
 
-    local matchVisible = assist.GetMatchFrame() ~= nil
-    local currentTurn = assist.GetCurrentTurnPlayerName()
-    local liveWord = assist.GetCurrentGameWord()
-    assist.TrackGameTurn(matchVisible, currentTurn, liveWord)
+    local currentTurn = sampledCurrentTurn
 
     assist.ExpirePendingWords(time())
     assist.UpdateAutoStatus()
@@ -3282,6 +3859,7 @@ assist.SafeConnect(RunService.Heartbeat, function()
     if isTurn and assist.lastSubmittedWord and assist.lastSubmissionWasAuto and not assist.isTyping and not assist.isRecovering then
         local rejectionReason = assist.GetSubmissionRejection()
         local timedOut = isTurn and assist.lastSubmittedAt > 0 and time() - assist.lastSubmittedAt >= assist.SUBMISSION_TIMEOUT
+        if timedOut and not rejectionReason then rejectionReason = assist.GetWrongAnswerReason() end
         if rejectionReason or timedOut then assist.RecoverFromWrongAutoWord(rejectionReason or "TIMEOUT") end
     end
 
@@ -3293,14 +3871,20 @@ assist.SafeConnect(RunService.Heartbeat, function()
         local scheduledVersion, scheduledTurn = assist.autoScheduleVersion, assist.turnVersion
         task.spawn(function()
             local attemptOK, attemptError = xpcall(function()
-            local reactionDelay = assist.humanizeEnabled and (0.25 + math.random() * 0.45) or (assist.auto_SpeedMode == 4 and 0.05 or (0.2 + math.random() * 0.3))
-            task.wait(reactionDelay)
+            local reactionDelay = (assist.spamModeEnabled or assist.auto_SpeedMode >= 4) and 0
+                or (assist.humanizeEnabled and (0.25 + math.random() * 0.45) or (assist.auto_SpeedMode == 4 and 0.05 or (0.2 + math.random() * 0.3)))
+            if reactionDelay > 0 then task.wait(reactionDelay) end
             if assist.running and scheduledVersion == assist.autoScheduleVersion and scheduledTurn == assist.turnVersion and assist.isAutoTypeEnabled and assist.IsMyTurn() then
                 local rl = assist.GetOriginalTurnPrompt(assist.GetCurrentGameWord())
                 local bm
+                local turboFallback = false
                 if assist.oneByOneEnabled then
                     local target = assist.GetOneByOneTarget(rl)
                     if target then bm = {target} end
+                elseif assist.spamModeEnabled and #assist.GetAutoSpamSuffixes() > 0 then
+                    local candidate
+                    candidate, turboFallback = assist.GetAutoSpamCandidate(rl)
+                    if candidate then bm = {candidate} end
                 else
                     if assist.autoTrapEnabled then
                         local giver = assist.FindAutomaticTrapGiver(rl)
@@ -3317,7 +3901,7 @@ assist.SafeConnect(RunService.Heartbeat, function()
                     end
                 end
                 if bm and bm[1] then
-                    local typed = assist.TypeWord(bm[1], rl, true)
+                    local typed = assist.TypeWord(bm[1], rl, true, turboFallback)
                     assist.autoStatusMessage = typed and (assist.oneByOneEnabled and "Auto-Type: letter submitted" or "Auto-Type: answer submitted") or "Auto-Type: input failed; retrying"
                 else
                     if assist.oneByOneEnabled and assist.oneByOneComputing[assist.GetOneByOneKey(rl)] then
